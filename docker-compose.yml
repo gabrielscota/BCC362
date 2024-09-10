@@ -1,0 +1,53 @@
+version: "3"
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: Coordinator.Dockerfile
+    container_name: coordinator
+    command: ["dart", "sync_coordinator.dart"]
+
+  sync0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sync0
+    ports:
+      - "8080:8080"
+    command: ["dart", "sync_server.dart", "0"]
+
+  sync1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sync1
+    ports:
+      - "8081:8080"
+    command: ["dart", "sync_server.dart", "1"]
+
+  sync2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sync2
+    ports:
+      - "8082:8080"
+    command: ["dart", "sync_server.dart", "2"]
+
+  sync3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sync3
+    ports:
+      - "8083:8080"
+    command: ["dart", "sync_server.dart", "3"]
+
+  sync4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sync4
+    ports:
+      - "8084:8080"
+    command: ["dart", "sync_server.dart", "4"]
