@@ -10,9 +10,10 @@ import 'package:logging/logging.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 
-// Fila de mensagens para garantir FIFO
-final Queue<Map<String, dynamic>> messageQueue = Queue();
+final Queue<Map<String, dynamic>> acquireQueue = Queue();
+final Queue<Map<String, dynamic>> releaseQueue = Queue();
 
+// Configuração do Logger
 void setupLogging() {
   Logger.root.level = Level.ALL;
   Logger.root.onRecord.listen((record) {
@@ -20,6 +21,7 @@ void setupLogging() {
   });
 }
 
+// Cria um cliente Pub/Sub com as credenciais do arquivo service-account.json
 Future<PubsubApi> createPubSubClient() async {
   final ServiceAccountCredentials accountCredentials =
       ServiceAccountCredentials.fromJson(File('service-account.json').readAsStringSync());
@@ -106,13 +108,13 @@ class SyncServer {
           if (decodedMessage['primitive'] == MessagePrimitive.ACQUIRE.name) {
             logger.info('Received ACQUIRE message: $decodedMessage');
 
-            // Adiciona a mensagem à fila de mensagens ACQUIRE)
-            final alreadyInQueue = messageQueue.any((element) =>
+            final alreadyInQueue = acquireQueue.any((element) =>
                 element['clusterSyncId'] == decodedMessage['clusterSyncId'] &&
                 element['messageId'] == decodedMessage['messageId']);
             if (!alreadyInQueue) {
-              messageQueue.add(decodedMessage);
-              logger.info('Added message (${decodedMessage['messageId']}) to queue: $messageQueue');
+              // Adiciona a mensagem à fila de mensagens ACQUIRE)
+              acquireQueue.add(decodedMessage);
+              logger.info('Added message (${decodedMessage['messageId']}) to queue: $acquireQueue');
 
               await pubSubClient.projects.subscriptions.acknowledge(
                 AcknowledgeRequest(ackIds: [receivedMessage.ackId!]),
@@ -122,24 +124,18 @@ class SyncServer {
           } else if (decodedMessage['primitive'] == MessagePrimitive.RELEASE.name) {
             logger.info('Received RELEASE message: $decodedMessage');
 
-            // Remove a mensagem da fila de mensagens ACQUIRE
-            messageQueue.removeWhere((element) =>
-                element['clusterSyncId'] == decodedMessage['clusterSyncId'] &&
-                element['messageId'] == decodedMessage['messageId']);
-            logger.info('Removed message (${decodedMessage['messageId']}) from queue: $messageQueue');
+            // Adiciona a mensagem à fila de mensagens RELEASE
+            releaseQueue.add(decodedMessage);
+            logger.info('Added message (${decodedMessage['messageId']}) to queue: $releaseQueue');
 
             await pubSubClient.projects.subscriptions.acknowledge(
               AcknowledgeRequest(ackIds: [receivedMessage.ackId!]),
               subscription,
             );
 
-            // Completa o Future do ACQUIRE correspondente
-            final messageId = decodedMessage['messageId'];
-            final completer = completerList.firstWhere((element) => element.containsKey(messageId)).values.first;
-            completer.complete(true);
-            completerList.removeWhere((element) => element.containsKey(messageId));
-
-            lastProcessedMessageId = -1;
+            if (acquireQueue.isNotEmpty && acquireQueue.first['messageId'] == decodedMessage['messageId']) {
+              lastProcessedMessageId = -1;
+            }
           }
         } catch (e) {
           logger.severe('Error decoding message: $e');
@@ -154,18 +150,22 @@ class SyncServer {
     while (true) {
       await Future.delayed(Duration(milliseconds: 100));
 
-      if (messageQueue.isEmpty) {
-        await Future.delayed(Duration(seconds: 5));
-      } else {
-        final message = messageQueue.first;
-        if (message['clusterSyncId'] == clusterSyncId && message['messageId'] != lastProcessedMessageId) {
-          // Acessa o recurso crítico
+      if (acquireQueue.isNotEmpty && releaseQueue.isNotEmpty) {
+        final acquireMessage = acquireQueue.first;
+        final releaseMessage = releaseQueue.first;
+
+        if (acquireMessage['messageId'] == releaseMessage['messageId']) {
+          acquireQueue.removeFirst();
+          releaseQueue.removeFirst();
+        }
+      } else if (acquireQueue.isNotEmpty && releaseQueue.isEmpty) {
+        final acquireMessage = acquireQueue.first;
+        final messageId = acquireMessage['messageId'];
+
+        if (acquireMessage['clusterSyncId'] == clusterSyncId && messageId != lastProcessedMessageId) {
           await accessResource();
-
-          // Publica uma mensagem de RELEASE
-          await publishReleaseMessage(message['messageId']);
-
-          lastProcessedMessageId = message['messageId'];
+          await publishReleaseMessage(messageId);
+          lastProcessedMessageId = messageId;
         }
       }
     }
@@ -174,7 +174,7 @@ class SyncServer {
   // Simula o acesso ao recurso
   Future<void> accessResource() async {
     logger.info('Sync $clusterSyncId accessing the critical section...');
-    int criticalRegionTime = 200 + Random().nextInt(801); // Tempo de acesso aleatório entre 200 e 1000ms
+    int criticalRegionTime = 200 + Random().nextInt(801);
     await Future.delayed(Duration(milliseconds: criticalRegionTime));
     logger.info('Sync $clusterSyncId left the critical section.');
   }
@@ -222,14 +222,14 @@ void main(List<String> args) async {
   // Inicia a escuta de mensagens do Pub/Sub
   syncServer.listenMessages();
 
-  // final Completer<bool> completer = Completer();
-  // await syncServer.publishAcquireMessage(completer);
+  final Completer<bool> completer = Completer();
+  await syncServer.publishAcquireMessage(completer);
 
-  // final Completer<bool> completer2 = Completer();
-  // await syncServer.publishAcquireMessage(completer2);
+  final Completer<bool> completer2 = Completer();
+  await syncServer.publishAcquireMessage(completer2);
 
-  // final Completer<bool> completer3 = Completer();
-  // await syncServer.publishAcquireMessage(completer3);
+  final Completer<bool> completer3 = Completer();
+  await syncServer.publishAcquireMessage(completer3);
 
   // Inicia o processamento de mensagens
   syncServer.processMessages();
