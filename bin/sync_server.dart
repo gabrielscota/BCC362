@@ -10,8 +10,8 @@ import 'package:logging/logging.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 
-final Queue<Map<String, dynamic>> acquireQueue = Queue();
-final Queue<Map<String, dynamic>> releaseQueue = Queue();
+Queue<Map<String, dynamic>> acquireQueue = Queue();
+Queue<Map<String, dynamic>> releaseQueue = Queue();
 
 // Configuração do Logger
 void setupLogging() {
@@ -54,7 +54,7 @@ class SyncServer {
 
   // Publica uma mensagem de ACQUIRE ao Pub/Sub com timestamp
   Future<void> publishAcquireMessage(Completer<bool> completer) async {
-    final int messageId = DateTime.now().millisecondsSinceEpoch;
+    final int messageId = DateTime.now().millisecondsSinceEpoch + Random().nextInt(1000);
     completerList.add({messageId: completer});
 
     final message = json.encode({
@@ -64,7 +64,12 @@ class SyncServer {
     });
     await pubSubClient.projects.topics.publish(
       PublishRequest(
-        messages: [PubsubMessage(data: base64Encode(utf8.encode(message)))],
+        messages: [
+          PubsubMessage(
+            data: base64Encode(utf8.encode(message)),
+            orderingKey: 'acquire',
+          )
+        ],
       ),
       topic,
     );
@@ -80,7 +85,12 @@ class SyncServer {
     });
     await pubSubClient.projects.topics.publish(
       PublishRequest(
-        messages: [PubsubMessage(data: base64Encode(utf8.encode(message)))],
+        messages: [
+          PubsubMessage(
+            data: base64Encode(utf8.encode(message)),
+            orderingKey: 'release',
+          )
+        ],
       ),
       topic,
     );
@@ -108,19 +118,14 @@ class SyncServer {
           if (decodedMessage['primitive'] == MessagePrimitive.ACQUIRE.name) {
             logger.info('Received ACQUIRE message: $decodedMessage');
 
-            final alreadyInQueue = acquireQueue.any((element) =>
-                element['clusterSyncId'] == decodedMessage['clusterSyncId'] &&
-                element['messageId'] == decodedMessage['messageId']);
-            if (!alreadyInQueue) {
-              // Adiciona a mensagem à fila de mensagens ACQUIRE)
-              acquireQueue.add(decodedMessage);
-              logger.info('Added message (${decodedMessage['messageId']}) to queue: $acquireQueue');
+            // Adiciona a mensagem à fila de mensagens ACQUIRE)
+            acquireQueue.add(decodedMessage);
+            logger.info('Added message (${decodedMessage['messageId']}) to queue: $acquireQueue');
 
-              await pubSubClient.projects.subscriptions.acknowledge(
-                AcknowledgeRequest(ackIds: [receivedMessage.ackId!]),
-                subscription,
-              );
-            }
+            await pubSubClient.projects.subscriptions.acknowledge(
+              AcknowledgeRequest(ackIds: [receivedMessage.ackId!]),
+              subscription,
+            );
           } else if (decodedMessage['primitive'] == MessagePrimitive.RELEASE.name) {
             logger.info('Received RELEASE message: $decodedMessage');
 
@@ -133,8 +138,11 @@ class SyncServer {
               subscription,
             );
 
-            if (acquireQueue.isNotEmpty && acquireQueue.first['messageId'] == decodedMessage['messageId']) {
-              lastProcessedMessageId = -1;
+            if (decodedMessage['clusterSyncId'] == clusterSyncId) {
+              final messageId = decodedMessage['messageId'];
+              final completer = completerList.firstWhere((element) => element.containsKey(messageId)).values.first;
+              completer.complete(true);
+              completerList.removeWhere((element) => element.containsKey(messageId));
             }
           }
         } catch (e) {
@@ -144,39 +152,67 @@ class SyncServer {
     }
   }
 
-  int lastProcessedMessageId = -1;
-
   Future<void> processMessages() async {
     while (true) {
-      await Future.delayed(Duration(milliseconds: 100));
+      await Future.delayed(Duration(milliseconds: 100)); // Controle de periodicidade
 
-      if (acquireQueue.isNotEmpty && releaseQueue.isNotEmpty) {
-        final acquireMessage = acquireQueue.first;
-        final releaseMessage = releaseQueue.first;
+      if (acquireQueue.isNotEmpty) {
+        final firstAcquireMessage = acquireQueue.first;
 
-        if (acquireMessage['messageId'] == releaseMessage['messageId']) {
-          acquireQueue.removeFirst();
-          releaseQueue.removeFirst();
-        }
-      } else if (acquireQueue.isNotEmpty && releaseQueue.isEmpty) {
-        final acquireMessage = acquireQueue.first;
-        final messageId = acquireMessage['messageId'];
+        if (firstAcquireMessage['clusterSyncId'] == clusterSyncId) {
+          final messageId = firstAcquireMessage['messageId'];
+          final hasReleaseMessage = releaseQueue.any((releaseMessage) => releaseMessage['messageId'] == messageId);
 
-        if (acquireMessage['clusterSyncId'] == clusterSyncId && messageId != lastProcessedMessageId) {
-          await accessResource();
-          await publishReleaseMessage(messageId);
-          lastProcessedMessageId = messageId;
+          if (!hasReleaseMessage) {
+            logger.info('Sync $clusterSyncId está acessando o recurso...');
+            await accessResource(messageId);
+            await publishReleaseMessage(messageId);
+            acquireQueue.removeFirst();
+            logger.info('Sync $clusterSyncId liberou o recurso e removeu a mensagem da fila de ACQUIRE.');
+          } else {
+            logger.info('Sync $clusterSyncId detectou que o recurso já foi liberado.');
+            releaseQueue.removeWhere((releaseMessage) => releaseMessage['messageId'] == messageId);
+            acquireQueue.removeFirst();
+            logger.info('Removida a mensagem de RELEASE da fila de RELEASE.');
+          }
+        } else {
+          // Coleta as mensagens que precisam ser removidas em uma lista temporária
+          List<int> messageIdsToRemove = [];
+
+          // Verifica se existe um RELEASE correspondente a outro sync na fila de ACQUIRE
+          for (var acquireMessage in acquireQueue) {
+            final acquireMessageId = acquireMessage['messageId'];
+            final acquireClusterId = acquireMessage['clusterSyncId'];
+
+            final hasReleaseMessage =
+                releaseQueue.any((releaseMessage) => releaseMessage['messageId'] == acquireMessageId);
+
+            if (hasReleaseMessage) {
+              logger.info('Sync $clusterSyncId detectou que o recurso do Sync $acquireClusterId foi liberado.');
+
+              // Adiciona o ID da mensagem para remoção após a iteração
+              messageIdsToRemove.add(acquireMessageId);
+            }
+          }
+
+          // Remove as mensagens coletadas da fila de ACQUIRE e RELEASE após a iteração
+          for (var messageId in messageIdsToRemove) {
+            acquireQueue.removeWhere((msg) => msg['messageId'] == messageId);
+            releaseQueue.removeWhere((releaseMessage) => releaseMessage['messageId'] == messageId);
+            logger
+                .info('Removidos ACQUIRE e RELEASE correspondentes do Sync com messageId $messageId das filas locais.');
+          }
         }
       }
     }
   }
 
   // Simula o acesso ao recurso
-  Future<void> accessResource() async {
-    logger.info('Sync $clusterSyncId accessing the critical section...');
+  Future<void> accessResource(int messageId) async {
+    logger.info('Sync $clusterSyncId e a mensagem ($messageId) está entrando na seção crítica...');
     int criticalRegionTime = 200 + Random().nextInt(801);
     await Future.delayed(Duration(milliseconds: criticalRegionTime));
-    logger.info('Sync $clusterSyncId left the critical section.');
+    logger.info('Sync $clusterSyncId e a mensagem ($messageId) saiu da seção crítica.');
   }
 }
 
@@ -221,15 +257,6 @@ void main(List<String> args) async {
 
   // Inicia a escuta de mensagens do Pub/Sub
   syncServer.listenMessages();
-
-  final Completer<bool> completer = Completer();
-  await syncServer.publishAcquireMessage(completer);
-
-  final Completer<bool> completer2 = Completer();
-  await syncServer.publishAcquireMessage(completer2);
-
-  final Completer<bool> completer3 = Completer();
-  await syncServer.publishAcquireMessage(completer3);
 
   // Inicia o processamento de mensagens
   syncServer.processMessages();
