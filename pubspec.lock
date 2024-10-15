@@ -135,7 +135,7 @@ packages:
     source: hosted
     version: "1.6.0"
   http:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: http
       sha256: b9c29a161230ee03d3ccf545097fccd9b87a5264228c5d348202e0f0c28f9010
@@ -270,6 +270,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.4"
+  redis:
+    dependency: "direct main"
+    description:
+      name: redis
+      sha256: "4a8218ef7b0642ff499147c7a105591208259e2f55f07db0101ace7f82f66cf9"
+      url: "https://pub.dev"
+    source: hosted
+    version: "4.0.0"
+  retry:
+    dependency: "direct main"
+    description:
+      name: retry
+      sha256: "822e118d5b3aafed083109c72d5f484c6dc66707885e07c0fbcb8b986bba7efc"
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.1.2"
   shelf:
     dependency: "direct main"
     description:

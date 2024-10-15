@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:redis/redis.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 
@@ -12,9 +13,17 @@ class StorageServer {
   String primaryAddress;
   List<String> backups = [];
   bool isRunning = true; // Controla se o servidor está ativo ou inativo
+  bool isInElection = false; // Controla se este nó já está em eleição
+  late Command redisClient; // Cliente Redis para lock distribuído
+  static const String ELECTION_LOCK_KEY = 'election_lock'; // Chave de lock para a eleição
   static const String FAILURE_TRIGGER_KEY = "trigger_failure"; // Chave para simular falha
 
   StorageServer(this.id, this.isPrimary, this.primaryAddress, this.backups);
+
+  // Conecta ao Redis para obter o lock distribuído
+  Future<void> connectToRedis() async {
+    redisClient = await RedisConnection().connect('redis', 6379);
+  }
 
   // Função para realizar a replicação nos backups
   Future<void> replicateToBackups(String content) async {
@@ -59,6 +68,7 @@ class StorageServer {
 
         await Future.delayed(Duration(seconds: 2)); // Simulação de tempo de escrita
         await replicateToBackups(content); // Replicar a escrita para os backups
+
         print('[INFO] Escrita e replicação concluídas no Primário $id.');
         return Response.ok('[INFO] Escrita bem-sucedida no Primário $id e replicada.');
       } catch (e) {
@@ -113,7 +123,7 @@ class StorageServer {
   // Função para verificar se o primário está vivo (heartbeat)
   Future<void> _checkPrimaryStatus() async {
     while (isRunning) {
-      if (!isPrimary) {
+      if (!isPrimary && !isInElection) {
         try {
           var client = HttpClient();
           var request = await client.getUrl(
@@ -133,16 +143,46 @@ class StorageServer {
   }
 
   // Eleição de um novo primário
-  void _startElection() async {
-    if (backups.isNotEmpty) {
-      print('[INFO] Backup $id se tornando o novo primário.');
-      isPrimary = true;
-      primaryAddress = 'storage$id'; // Atualiza o endereço do primário
-      backups.remove('storage$id'); // Remove este servidor da lista de backups
+  Future<void> _startElection() async {
+    isInElection = true;
+    print('[INFO] Backup $id iniciando processo de eleição.');
 
-      // Notificar os outros backups que este servidor agora é o primário
-      await notifyBackups();
+    // Tentar adquirir o lock da eleição via Redis
+    if (await _acquireRedisLock()) {
+      print('[INFO] Backup $id adquiriu o lock de eleição.');
+      // Se adquirir o lock, torna-se primário
+      _becomePrimary();
+    } else {
+      print('[INFO] Backup $id não conseguiu adquirir o lock de eleição.');
     }
+    isInElection = false;
+  }
+
+  // Tenta adquirir o lock para a eleição via Redis
+  Future<bool> _acquireRedisLock() async {
+    try {
+      var result = await redisClient.send_object(['SET', ELECTION_LOCK_KEY, id, 'NX', 'PX', 5000]);
+      if (result == 'OK') {
+        return true; // Lock adquirido
+      } else {
+        print('[INFO] Lock de eleição já adquirido por outro servidor.');
+        return false; // Lock já adquirido por outro
+      }
+    } catch (e) {
+      print('[ERROR] Erro ao tentar adquirir o lock de eleição no Redis: $e');
+      return false;
+    }
+  }
+
+  // Torna-se o primário e notifica os backups
+  Future<void> _becomePrimary() async {
+    print('[INFO] Backup $id se tornando o novo primário.');
+    isPrimary = true;
+    primaryAddress = 'storage$id'; // Atualiza o endereço do primário
+    backups.remove('storage$id'); // Remove este servidor da lista de backups
+
+    // Notificar os outros backups que este servidor agora é o primário
+    await notifyBackups();
   }
 
   // Notifica os backups que um novo primário foi eleito
@@ -201,6 +241,8 @@ class StorageServer {
 
   // Iniciar o servidor com Shelf
   void start() async {
+    await connectToRedis(); // Conecta ao Redis
+
     var handler = const Pipeline().addMiddleware(customLogRequests()).addHandler((Request request) {
       if (request.method == 'POST' && request.url.path == 'write') {
         return _handleWrite(request);

@@ -6,7 +6,9 @@ import 'dart:math';
 
 import 'package:googleapis/pubsub/v1.dart';
 import 'package:googleapis_auth/auth_io.dart';
+import 'package:http/http.dart' as http;
 import 'package:logging/logging.dart';
+import 'package:retry/retry.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 
@@ -213,30 +215,64 @@ class SyncServer {
   // Simula o acesso ao recurso
   Future<void> accessResource(int messageId, String data) async {
     final Random random = Random();
-    String storageHost = storageHosts[random.nextInt(storageHosts.length)];
-    int storageServerId = int.parse(storageHost.split('storage').last);
+    String storageHost = '';
+    int storageServerId = -1;
 
     try {
-      var client = HttpClient();
-      var request = await client.postUrl(Uri.parse('http://$storageHost:${storageServerId + 8085}/write'));
-      request.headers.contentType = ContentType.json;
+      // var client = HttpClient();
+      final response = await retry(
+        () {
+          storageHost = storageHosts[random.nextInt(storageHosts.length)];
+          storageServerId = int.parse(storageHost.split('storage').last);
+
+          final String body;
+          if (clusterSyncId == '0' && !alreadyTriggeredStorageFailure) {
+            body = jsonEncode({'data': data, 'trigger_failure': true});
+            alreadyTriggeredStorageFailure = true;
+          } else {
+            body = jsonEncode({'data': data});
+          }
+
+          return http
+              .post(
+                Uri.parse('http://$storageHost:${storageServerId + 8085}/write'),
+                headers: {'Content-Type': 'application/json'},
+                body: body,
+              )
+              .timeout(Duration(seconds: 5));
+        },
+        onRetry: (e) {
+          storageHosts.removeAt(storageHosts.indexOf(storageHost));
+          print('Removendo Storage Server $storageServerId da lista de hosts disponíveis por falha de conexão.');
+        },
+        retryIf: (e) => e is SocketException || e is TimeoutException || e is http.ClientException,
+      );
+      print(response.body);
+      if (response.statusCode == HttpStatus.ok) {
+        var responseBody = response.body;
+        print('Resposta do Storage Server $storageServerId: $responseBody');
+      } else {
+        print('Falha ao acessar o Storage Server $storageServerId. Código: ${response.statusCode}');
+      }
+      // var request = await client.postUrl(Uri.parse('http://$storageHost:${storageServerId + 8085}/write'));
+      // request.headers.contentType = ContentType.json;
       // if (clusterSyncId == '0' && !alreadyTriggeredStorageFailure) {
       //   data = jsonEncode({'data': data, 'trigger_failure': true});
       //   alreadyTriggeredStorageFailure = true;
       // } else {
       //   data = jsonEncode({'data': data});
       // }
-      final body = jsonEncode({'data': data});
-      request.write(body);
+      // final body = jsonEncode({'data': data});
+      // request.write(body);
 
-      var response = await request.close();
+      // var response = await request.close();
 
-      if (response.statusCode == HttpStatus.ok) {
-        var responseBody = await utf8.decoder.bind(response).join();
-        print('Resposta do Storage Server $storageServerId: $responseBody');
-      } else {
-        print('Falha ao acessar o Storage Server $storageServerId. Código: ${response.statusCode}');
-      }
+      // if (response.statusCode == HttpStatus.ok) {
+      //   var responseBody = await utf8.decoder.bind(response).join();
+      //   print('Resposta do Storage Server $storageServerId: $responseBody');
+      // } else {
+      //   print('Falha ao acessar o Storage Server $storageServerId. Código: ${response.statusCode}');
+      // }
     } catch (e) {
       print('Erro ao conectar com o Storage Server $storageServerId: $e');
     }
