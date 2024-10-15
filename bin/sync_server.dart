@@ -73,7 +73,7 @@ class SyncServer {
       ),
       topic,
     );
-    logger.info('Published ACQUIRE message: $message');
+    // logger.info('Published ACQUIRE message: $message');
   }
 
   // Envia uma mensagem de RELEASE ao Pub/Sub, incluindo o timestamp original de ACQUIRE
@@ -94,7 +94,7 @@ class SyncServer {
       ),
       topic,
     );
-    logger.info('Published RELEASE message: $message');
+    // logger.info('Published RELEASE message: $message');
   }
 
   // Escuta mensagens do Pub/Sub e processa as de ACQUIRE e RELEASE
@@ -116,22 +116,22 @@ class SyncServer {
           final decodedMessage = json.decode(message);
 
           if (decodedMessage['primitive'] == MessagePrimitive.ACQUIRE.name) {
-            logger.info('Received ACQUIRE message: $decodedMessage');
+            // logger.info('Received ACQUIRE message: $decodedMessage');
 
             // Adiciona a mensagem à fila de mensagens ACQUIRE)
             acquireQueue.add(decodedMessage);
-            logger.info('Added message (${decodedMessage['messageId']}) to queue: $acquireQueue');
+            // logger.info('Added message (${decodedMessage['messageId']}) to queue: $acquireQueue');
 
             await pubSubClient.projects.subscriptions.acknowledge(
               AcknowledgeRequest(ackIds: [receivedMessage.ackId!]),
               subscription,
             );
           } else if (decodedMessage['primitive'] == MessagePrimitive.RELEASE.name) {
-            logger.info('Received RELEASE message: $decodedMessage');
+            // logger.info('Received RELEASE message: $decodedMessage');
 
             // Adiciona a mensagem à fila de mensagens RELEASE
             releaseQueue.add(decodedMessage);
-            logger.info('Added message (${decodedMessage['messageId']}) to queue: $releaseQueue');
+            // logger.info('Added message (${decodedMessage['messageId']}) to queue: $releaseQueue');
 
             await pubSubClient.projects.subscriptions.acknowledge(
               AcknowledgeRequest(ackIds: [receivedMessage.ackId!]),
@@ -164,16 +164,16 @@ class SyncServer {
           final hasReleaseMessage = releaseQueue.any((releaseMessage) => releaseMessage['messageId'] == messageId);
 
           if (!hasReleaseMessage) {
-            logger.info('Sync $clusterSyncId está acessando o recurso...');
-            await accessResource(messageId);
+            // logger.info('Sync $clusterSyncId está acessando o recurso...');
+            await accessResource(messageId, 'Data from Sync $clusterSyncId');
             await publishReleaseMessage(messageId);
             acquireQueue.removeFirst();
-            logger.info('Sync $clusterSyncId liberou o recurso e removeu a mensagem da fila de ACQUIRE.');
+            // logger.info('Sync $clusterSyncId liberou o recurso e removeu a mensagem da fila de ACQUIRE.');
           } else {
-            logger.info('Sync $clusterSyncId detectou que o recurso já foi liberado.');
+            // logger.info('Sync $clusterSyncId detectou que o recurso já foi liberado.');
             releaseQueue.removeWhere((releaseMessage) => releaseMessage['messageId'] == messageId);
             acquireQueue.removeFirst();
-            logger.info('Removida a mensagem de RELEASE da fila de RELEASE.');
+            // logger.info('Removida a mensagem de RELEASE da fila de RELEASE.');
           }
         } else {
           // Coleta as mensagens que precisam ser removidas em uma lista temporária
@@ -182,13 +182,13 @@ class SyncServer {
           // Verifica se existe um RELEASE correspondente a outro sync na fila de ACQUIRE
           for (var acquireMessage in acquireQueue) {
             final acquireMessageId = acquireMessage['messageId'];
-            final acquireClusterId = acquireMessage['clusterSyncId'];
+            // final acquireClusterId = acquireMessage['clusterSyncId'];
 
             final hasReleaseMessage =
                 releaseQueue.any((releaseMessage) => releaseMessage['messageId'] == acquireMessageId);
 
             if (hasReleaseMessage) {
-              logger.info('Sync $clusterSyncId detectou que o recurso do Sync $acquireClusterId foi liberado.');
+              // logger.info('Sync $clusterSyncId detectou que o recurso do Sync $acquireClusterId foi liberado.');
 
               // Adiciona o ID da mensagem para remoção após a iteração
               messageIdsToRemove.add(acquireMessageId);
@@ -199,20 +199,47 @@ class SyncServer {
           for (var messageId in messageIdsToRemove) {
             acquireQueue.removeWhere((msg) => msg['messageId'] == messageId);
             releaseQueue.removeWhere((releaseMessage) => releaseMessage['messageId'] == messageId);
-            logger
-                .info('Removidos ACQUIRE e RELEASE correspondentes do Sync com messageId $messageId das filas locais.');
+            // logger
+            //     .info('Removidos ACQUIRE e RELEASE correspondentes do Sync com messageId $messageId das filas locais.');
           }
         }
       }
     }
   }
 
+  bool alreadyTriggeredStorageFailure = false;
+  List<String> storageHosts = ['storage0', 'storage1', 'storage2'];
+
   // Simula o acesso ao recurso
-  Future<void> accessResource(int messageId) async {
-    logger.info('Sync $clusterSyncId e a mensagem ($messageId) está entrando na seção crítica...');
-    int criticalRegionTime = 200 + Random().nextInt(801);
-    await Future.delayed(Duration(milliseconds: criticalRegionTime));
-    logger.info('Sync $clusterSyncId e a mensagem ($messageId) saiu da seção crítica.');
+  Future<void> accessResource(int messageId, String data) async {
+    final Random random = Random();
+    String storageHost = storageHosts[random.nextInt(storageHosts.length)];
+    int storageServerId = int.parse(storageHost.split('storage').last);
+
+    try {
+      var client = HttpClient();
+      var request = await client.postUrl(Uri.parse('http://$storageHost:${storageServerId + 8085}/write'));
+      request.headers.contentType = ContentType.json;
+      // if (clusterSyncId == '0' && !alreadyTriggeredStorageFailure) {
+      //   data = jsonEncode({'data': data, 'trigger_failure': true});
+      //   alreadyTriggeredStorageFailure = true;
+      // } else {
+      //   data = jsonEncode({'data': data});
+      // }
+      final body = jsonEncode({'data': data});
+      request.write(body);
+
+      var response = await request.close();
+
+      if (response.statusCode == HttpStatus.ok) {
+        var responseBody = await utf8.decoder.bind(response).join();
+        print('Resposta do Storage Server $storageServerId: $responseBody');
+      } else {
+        print('Falha ao acessar o Storage Server $storageServerId. Código: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Erro ao conectar com o Storage Server $storageServerId: $e');
+    }
   }
 }
 

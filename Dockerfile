@@ -6,7 +6,7 @@ WORKDIR /app
 
 # Copiar os arquivos Dart e pubspec.yaml para o container
 COPY pubspec.yaml .
-COPY bin/sync_server.dart .
+COPY bin/ .
 COPY service-account.json .
 
 # Instalar as dependências
